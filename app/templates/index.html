@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>公路检测交验系统</title>
+<style>
+  body { font-family: "PingFang SC", "Microsoft YaHei", sans-serif; margin: 24px; color: #222; }
+  h1 { font-size: 22px; } h2 { font-size: 17px; margin-top: 28px; border-left: 4px solid #2b6cb0; padding-left: 8px; }
+  table { border-collapse: collapse; margin-top: 8px; font-size: 14px; }
+  th, td { border: 1px solid #cbd5e0; padding: 5px 10px; text-align: left; }
+  th { background: #edf2f7; }
+  .msg { padding: 10px 14px; border-radius: 6px; margin: 12px 0; }
+  .msg.ok { background: #c6f6d5; color: #22543d; }
+  .msg.err { background: #fed7d7; color: #742a2a; }
+  .cols { display: flex; gap: 24px; flex-wrap: wrap; }
+  .panel { border: 1px solid #cbd5e0; border-radius: 8px; padding: 14px 18px; min-width: 320px; }
+  .panel h3 { margin-top: 0; }
+  .hint { color: #718096; font-size: 12px; }
+  input, select { padding: 4px 6px; margin: 2px 0; }
+  button { padding: 6px 16px; background: #2b6cb0; color: #fff; border: 0; border-radius: 5px; cursor: pointer; }
+  button:hover { background: #2c5282; }
+  tr.pass td { background: #f0fff4; }
+  tr.fail td { background: #fff5f5; }
+  .badge { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px; }
+  .badge.pass { background: #48bb78; color: #fff; }
+  .badge.fail { background: #e53e3e; color: #fff; }
+  label { display: inline-block; min-width: 56px; }
+</style>
+</head>
+<body>
+<h1>公路检测交验系统</h1>
+
+{% if msg %}
+<div class="msg {{ 'ok' if ok else 'err' }}">{{ msg }}</div>
+{% endif %}
+
+<h2>1. 上传 CSV(按车道、批号录入; 同批号再次上传即整批更正)</h2>
+<div class="cols">
+  <div class="panel">
+    <h3>重铺批次</h3>
+    <form method="post" action="/upload/repave" enctype="multipart/form-data">
+      <div><label>车道</label><input name="lane" required placeholder="如 K0-K10左幅"></div>
+      <div><label>批号</label><input name="batch_no" required placeholder="如 RP-2026-01"></div>
+      <div><label>文件</label><input type="file" name="file" accept=".csv" required></div>
+      <button type="submit">上传重铺 CSV</button>
+    </form>
+    <p class="hint">列: <code>start_m,end_m,completed_at</code><br>
+    左闭右开整数米段 [start_m, end_m); completed_at 为完工时刻(UTC 秒)</p>
+  </div>
+  <div class="panel">
+    <h3>检测批次</h3>
+    <form method="post" action="/upload/inspect" enctype="multipart/form-data">
+      <div><label>车道</label><input name="lane" required placeholder="如 K0-K10左幅"></div>
+      <div><label>批号</label><input name="batch_no" required placeholder="如 JC-2026-01"></div>
+      <div><label>文件</label><input type="file" name="file" accept=".csv" required></div>
+      <button type="submit">上传检测 CSV</button>
+    </form>
+    <p class="hint">列: <code>start_m,end_m,measured_at,device_id,run_id</code><br>
+    measured_at 为检测时刻(UTC 秒); device_id 设备号; run_id 跑次号</p>
+  </div>
+</div>
+
+<h2>2. 已提交批次</h2>
+{% if batches %}
+<table>
+  <tr><th>车道</th><th>类型</th><th>批号</th><th>行数</th><th>提交时刻(UTC秒)</th><th>提交时间</th></tr>
+  {% for b in batches %}
+  <tr>
+    <td>{{ b["lane"] }}</td>
+    <td>{{ "重铺" if b["kind"] == "repave" else "检测" }}</td>
+    <td>{{ b["batch_no"] }}</td>
+    <td>{{ b["row_count"] }}</td>
+    <td>{{ b["uploaded_at"] }}</td>
+    <td>{{ b["uploaded_at"]|ts }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% else %}
+<p class="hint">暂无批次。</p>
+{% endif %}
+
+<h2>3. 交验查询</h2>
+<form method="get" action="/">
+  <label>车道</label>
+  <input name="lane" list="lane-list" value="{{ q_lane }}" required>
+  <datalist id="lane-list">
+    {% for l in lanes %}<option value="{{ l }}">{% endfor %}
+  </datalist>
+  <label>起点(米)</label><input name="start_m" type="number" min="0" step="1" value="{{ q_start }}" required>
+  <label>终点(米)</label><input name="end_m" type="number" min="1" step="1" value="{{ q_end }}" required>
+  <button type="submit">查询</button>
+</form>
+<p class="hint">规则: 每处需 {{ needed }} 台不同设备的有效跑次覆盖才合格; 已重铺处只认最近一次完工时刻之后的跑次。</p>
+
+{% if error %}
+<div class="msg err">{{ error }}</div>
+{% endif %}
+
+{% if results is not none %}
+  {% if results %}
+  <p>共 {{ results|length }} 段{% if truncated %}(仅显示前 {{ limit }} 段, 请缩小范围){% endif %}:</p>
+  <table>
+    <tr>
+      <th>里程段(米, 左闭右开)</th><th>结论</th><th>还缺设备(台)</th>
+      <th>有效设备1(跑次)</th><th>有效设备2(跑次)</th><th>最近重铺完工(UTC秒)</th>
+    </tr>
+    {% for r in results %}
+    <tr class="{{ 'pass' if r.qualified else 'fail' }}">
+      <td>[{{ r.start_m }}, {{ r.end_m }})</td>
+      <td><span class="badge {{ 'pass' if r.qualified else 'fail' }}">{{ "合格" if r.qualified else "不合格" }}</span></td>
+      <td>{{ r.missing }}</td>
+      <td>{% if r.device1 %}{{ r.device1 }}(跑次 {{ r.run1 }}){% else %}—{% endif %}</td>
+      <td>{% if r.device2 %}{{ r.device2 }}(跑次 {{ r.run2 }}){% else %}—{% endif %}</td>
+      <td>{% if r.threshold > 0 %}{{ r.threshold }}({{ r.threshold|ts }}){% else %}—{% endif %}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <p class="hint">该车道在此里程范围内没有任何已提交的数据。</p>
+  {% endif %}
+{% endif %}
+
+</body>
+</html>

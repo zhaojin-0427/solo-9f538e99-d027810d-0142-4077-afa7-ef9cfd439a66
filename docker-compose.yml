@@ -1,0 +1,14 @@
+services:
+  web:
+    build: .
+    container_name: road-acceptance
+    ports:
+      - "8000:8000"
+    environment:
+      DB_PATH: /data/acceptance.db
+    volumes:
+      - acceptance-data:/data
+    restart: unless-stopped
+
+volumes:
+  acceptance-data:
