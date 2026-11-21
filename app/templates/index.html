@@ -56,8 +56,9 @@
       <div><label>文件</label><input type="file" name="file" accept=".csv" required></div>
       <button type="submit">上传检测 CSV</button>
     </form>
-    <p class="hint">列: <code>start_m,end_m,measured_at,device_id,run_id</code><br>
-    measured_at 为检测时刻(UTC 秒); device_id 设备号; run_id 跑次号</p>
+    <p class="hint">列: <code>start_m,end_m,measured_at,device_id,run_id</code>(可选列 <code>iri</code>)<br>
+    measured_at 为检测时刻(UTC 秒); device_id 设备号; run_id 跑次号<br>
+    iri 为可选测值, 填非负整数(单位 0.001 m/km); 未填的记录照常用于交验</p>
   </div>
 </div>
 
@@ -120,6 +121,145 @@
   <p class="hint">该车道在此里程范围内没有任何已提交的数据。</p>
   {% endif %}
 {% endif %}
+
+<h2>4. 平整度复核比对(IRI)</h2>
+<form method="get" action="/">
+  <label>车道</label>
+  <select name="cmp_lane" id="cmp-lane">
+    <option value="">-- 请选择 --</option>
+    {% for l in lanes %}
+    <option value="{{ l }}" {{ "selected" if l == q_cmp_lane }}>{{ l }}</option>
+    {% endfor %}
+  </select>
+  <label>设备1</label><select name="dev_a" id="dev-a"></select>
+  <label>跑次1</label><select name="run_a" id="run-a"></select>
+  <label>设备2</label><select name="dev_b" id="dev-b"></select>
+  <label>跑次2</label><select name="run_b" id="run-b"></select>
+  <button type="submit">比对</button>
+</form>
+<p class="hint">
+  逐段列出两边都能用完整原段连续拼成的最小共用区间; 均值为原段 iri 按原段长度加权,
+  差值 = 设备1 − 设备2; 单位换算: 1000 = 1.000 m/km。同车道、设备、跑次内起止与测值
+  都相同的记录只算一份。本页数据与上方交验结果取自同一份已提交快照。
+</p>
+
+{% if cmp_error %}
+<div class="msg err">{{ cmp_error }}</div>
+{% endif %}
+
+{% if cmp %}
+  {% if not cmp.has_value_a or not cmp.has_value_b %}
+  <p class="hint">
+    {% if not cmp.has_value_a %}跑次 {{ cmp.run_a }}(设备 {{ cmp.dev_a }})没有带测值(iri)的记录。{% endif %}
+    {% if not cmp.has_value_b %}跑次 {{ cmp.run_b }}(设备 {{ cmp.dev_b }})没有带测值(iri)的记录。{% endif %}
+  </p>
+  {% endif %}
+  <h3>最小共用区间({{ cmp.dev_a }}/{{ cmp.run_a }} 对 {{ cmp.dev_b }}/{{ cmp.run_b }})</h3>
+  {% if cmp.common %}
+  <p>共 {{ cmp.common|length }} 段{% if cmp.truncated %}(仅显示前 {{ limit }} 段){% endif %}:</p>
+  <table>
+    <tr>
+      <th>里程段(米, 左闭右开)</th><th>长度(米)</th>
+      <th>{{ cmp.dev_a }} 均值(m/km)</th><th>{{ cmp.dev_b }} 均值(m/km)</th>
+      <th>差值 设备1−设备2(m/km)</th>
+    </tr>
+    {% for c in cmp.common %}
+    <tr>
+      <td>[{{ c.start_m }}, {{ c.end_m }})</td>
+      <td>{{ c.end_m - c.start_m }}</td>
+      <td>{{ "%.3f"|format(c.iri_a / 1000) }}</td>
+      <td>{{ "%.3f"|format(c.iri_b / 1000) }}</td>
+      <td>{{ "%+.3f"|format(c.diff / 1000) }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <p class="hint">两个跑次没有能用完整原段连续拼成的共用里程。</p>
+  {% endif %}
+
+  <h3>有测值却未配对的里程</h3>
+  <div class="cols">
+    <div class="panel">
+      <h3>{{ cmp.dev_a }}(跑次 {{ cmp.run_a }})</h3>
+      {% if cmp.unpaired_a %}
+      <table>
+        <tr><th>里程段(米)</th><th>长度(米)</th></tr>
+        {% for u in cmp.unpaired_a %}
+        <tr><td>[{{ u.start_m }}, {{ u.end_m }})</td><td>{{ u.end_m - u.start_m }}</td></tr>
+        {% endfor %}
+      </table>
+      {% else %}
+      <p class="hint">无</p>
+      {% endif %}
+    </div>
+    <div class="panel">
+      <h3>{{ cmp.dev_b }}(跑次 {{ cmp.run_b }})</h3>
+      {% if cmp.unpaired_b %}
+      <table>
+        <tr><th>里程段(米)</th><th>长度(米)</th></tr>
+        {% for u in cmp.unpaired_b %}
+        <tr><td>[{{ u.start_m }}, {{ u.end_m }})</td><td>{{ u.end_m - u.start_m }}</td></tr>
+        {% endfor %}
+      </table>
+      {% else %}
+      <p class="hint">无</p>
+      {% endif %}
+    </div>
+  </div>
+{% endif %}
+
+<script>
+// 比对区联动下拉: 选车道后拉取有测值的设备/跑次, 选设备后填充其跑次
+(function () {
+  const laneSel = document.getElementById("cmp-lane");
+  const devA = document.getElementById("dev-a"), devB = document.getElementById("dev-b");
+  const runA = document.getElementById("run-a"), runB = document.getElementById("run-b");
+  const picked = {
+    dev_a: {{ q_dev_a | tojson }}, run_a: {{ q_run_a | tojson }},
+    dev_b: {{ q_dev_b | tojson }}, run_b: {{ q_run_b | tojson }},
+  };
+  let devices = [];
+
+  function fill(select, values, want) {
+    select.innerHTML = "";
+    const ph = document.createElement("option");
+    ph.value = ""; ph.textContent = "-- 请选择 --";
+    select.appendChild(ph);
+    for (const v of values) {
+      const o = document.createElement("option");
+      o.value = v; o.textContent = v;
+      if (v === want) o.selected = true;
+      select.appendChild(o);
+    }
+  }
+
+  function fillRuns(devSel, runSel, wantRun) {
+    const d = devices.find((x) => x.device_id === devSel.value);
+    fill(runSel, d ? d.runs : [], wantRun);
+  }
+
+  async function loadRuns() {
+    const lane = laneSel.value;
+    devices = [];
+    fill(devA, [], ""); fill(devB, [], "");
+    fill(runA, [], ""); fill(runB, [], "");
+    if (!lane) return;
+    try {
+      const r = await fetch("/api/inspect_runs?lane=" + encodeURIComponent(lane));
+      const data = await r.json();
+      devices = data.devices || [];
+    } catch (e) { devices = []; }
+    const ids = devices.map((d) => d.device_id);
+    fill(devA, ids, picked.dev_a); fill(devB, ids, picked.dev_b);
+    fillRuns(devA, runA, picked.run_a); fillRuns(devB, runB, picked.run_b);
+  }
+
+  laneSel.addEventListener("change", loadRuns);
+  devA.addEventListener("change", () => fillRuns(devA, runA, ""));
+  devB.addEventListener("change", () => fillRuns(devB, runB, ""));
+  loadRuns();
+})();
+</script>
 
 </body>
 </html>

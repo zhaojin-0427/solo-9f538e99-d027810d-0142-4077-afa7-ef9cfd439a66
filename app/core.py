@@ -3,10 +3,16 @@
 - CSV 解析与校验(整批校验, 任何一行错误则整批拒绝)
 - 区间扫描(sweep line)计算交验结果, 只按区间端点切分, 不逐米展开
 - 批次应用: 原始批次与交验结果在同一事务中生效; 更正只重算旧批和新批涉及的米段
+- 平整度(IRI)复核: 上传时检查组内带测值区间冲突; 两跑次比对求最小共用区间
 
 交验规则:
   每处(每个原子区间)需要 NEEDED_DEVICES 台不同设备的有效跑次覆盖才算合格;
   已重铺的位置, 只认最近一次完工时刻(threshold)之后检测的跑次。
+
+测值(iri)规则:
+  检测 CSV 可带可选列 iri(0.001 m/km 为单位的非负整数); 未填的记录照常用于交验,
+  只是不参与冲突检查与跑次比对。同车道、设备、跑次内, 起止与测值都相同的记录
+  视为同一份(去重); 除此之外同组带测值区间相交即冲突, 上传时整批拒绝。
 """
 from __future__ import annotations
 
@@ -19,6 +25,7 @@ NEEDED_DEVICES = 2  # 每处合格所需的不同设备台数
 
 REPAVE_COLUMNS = ["start_m", "end_m", "completed_at"]
 INSPECT_COLUMNS = ["start_m", "end_m", "measured_at", "device_id", "run_id"]
+INSPECT_OPTIONAL_COLUMNS = ["iri"]  # 可选测值列: 0.001 m/km 为单位的非负整数
 
 MAX_ROWS_PER_UPLOAD = 1_000_000
 MAX_FIELD_LEN = 64
@@ -63,7 +70,7 @@ def _check_span(s, e, lineno, errors):
     return True
 
 
-def _parse_csv(text, columns, build_row):
+def _parse_csv(text, columns, build_row, optional=()):
     reader = csv.reader(io.StringIO(text))
     rows, errors = [], []
     idx = None
@@ -76,6 +83,9 @@ def _parse_csv(text, columns, build_row):
             if missing:
                 raise CsvError(f"CSV 缺少列 {missing}; 需要的列: {columns}")
             idx = {c: header.index(c) for c in columns}
+            for c in optional:  # 可选列: 表头里有才解析
+                if c in header:
+                    idx[c] = header.index(c)
             continue
         if len(rows) >= MAX_ROWS_PER_UPLOAD:
             errors.append(f"超过单次上传最大行数 {MAX_ROWS_PER_UPLOAD}")
@@ -116,9 +126,20 @@ def _inspect_row(rec, idx, lineno, errors):
     if t is not None and t < 0:
         errors.append(f"第{lineno}行: measured_at 需 >= 0")
         t = None
-    if not _check_span(s, e, lineno, errors) or None in (t, d, r):
+    iri = None
+    iri_ok = True
+    if "iri" in idx:  # 可选列: 留空表示无测值
+        raw = str(get("iri")).strip()
+        if raw:
+            iri = _to_int(raw, "iri", lineno, errors)
+            if iri is not None and iri < 0:
+                errors.append(f"第{lineno}行: iri 需为非负整数(0.001 m/km)")
+                iri = None
+            if iri is None:
+                iri_ok = False
+    if not _check_span(s, e, lineno, errors) or None in (t, d, r) or not iri_ok:
         return None
-    return (s, e, t, d, r)
+    return (s, e, t, d, r, iri)
 
 
 def parse_repave_csv(text):
@@ -127,8 +148,11 @@ def parse_repave_csv(text):
 
 
 def parse_inspect_csv(text):
-    """返回 [(start_m, end_m, measured_at, device_id, run_id), ...]"""
-    return _parse_csv(text, INSPECT_COLUMNS, _inspect_row)
+    """返回 [(start_m, end_m, measured_at, device_id, run_id, iri), ...]
+
+    iri 为可选列: 表头无此列或单元格留空时为 None(无测值, 照常用于交验)。
+    """
+    return _parse_csv(text, INSPECT_COLUMNS, _inspect_row, INSPECT_OPTIONAL_COLUMNS)
 
 
 # ---------------------------------------------------------------- 区间扫描
@@ -336,6 +360,31 @@ def recompute_components(conn, lane, components):
             _merge_boundary(cur, lane, hhi)
 
 
+# ---------------------------------------------------------------- 测值冲突检查
+
+def check_iri_conflicts(conn, lane, groups):
+    """检查 (lane, device_id, run_id) 各组内带测值(iri)区间是否相交。
+
+    按本批生效后的数据检查(即含本次写入的全部批次记录)。同组内起止与测值
+    都相同的记录视为同一份(去重, 可能由不同批次提供); 除此之外, 两条带测值
+    区间相交即冲突, 抛出 CsvError(报出跑次与冲突里程), 由调用方回滚整批。
+    """
+    for dev, run in sorted(groups):
+        rows = conn.execute(
+            "SELECT start_m,end_m,iri FROM inspect_segments "
+            "WHERE lane=? AND device_id=? AND run_id=? AND iri IS NOT NULL",
+            (lane, dev, run),
+        ).fetchall()
+        segs = sorted({(r[0], r[1], r[2]) for r in rows})  # 去重后按起点排序
+        for (s1, e1, _), (s2, e2, _) in zip(segs, segs[1:]):
+            if s2 < e1:  # 左闭右开区间相交(相邻不算)
+                raise CsvError(
+                    f"设备 {dev} 跑次 {run} 的带测值区间相交: "
+                    f"[{s1}, {e1}) 与 [{s2}, {e2}), "
+                    f"冲突里程 [{s2}, {min(e1, e2)})"
+                )
+
+
 def apply_batch(conn, lane, kind, batch_no, rows, uploaded_at):
     """应用一个批次(录入或整批更正)。调用方负责事务(BEGIN/COMMIT/ROLLBACK)。
 
@@ -357,10 +406,16 @@ def apply_batch(conn, lane, kind, batch_no, rows, uploaded_at):
         )
     else:
         cur.executemany(
-            "INSERT INTO inspect_segments(lane,start_m,end_m,measured_at,device_id,run_id,batch_no) "
-            "VALUES (?,?,?,?,?,?,?)",
-            [(lane, s, e, t, d, r, batch_no) for s, e, t, d, r in rows],
+            "INSERT INTO inspect_segments"
+            "(lane,start_m,end_m,measured_at,device_id,run_id,iri,batch_no) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            [(lane, s, e, t, d, r, iri, batch_no) for s, e, t, d, r, iri in rows],
         )
+        # 本批生效后, 检查其涉及的同组(车道+设备+跑次)带测值区间是否冲突;
+        # 冲突则抛错, 整批回滚, 原数据与交验结果照旧
+        groups = {(d, r) for _, _, _, d, r, iri in rows if iri is not None}
+        if groups:
+            check_iri_conflicts(conn, lane, groups)
     cur.execute(
         "INSERT INTO batches(lane,kind,batch_no,uploaded_at,row_count) VALUES (?,?,?,?,?) "
         "ON CONFLICT(lane,kind,batch_no) DO UPDATE SET "
@@ -369,6 +424,104 @@ def apply_batch(conn, lane, kind, batch_no, rows, uploaded_at):
     )
     affected = [(r[0], r[1]) for r in old] + [(row[0], row[1]) for row in rows]
     recompute_components(conn, lane, merge_ranges(affected))
+
+
+# ---------------------------------------------------------------- 跑次比对(IRI 复核)
+
+def load_iri_segments(conn, lane, device_id, run_id):
+    """取某跑次全部带测值区间(跨批次), 去重(起止与测值相同只算一份)后排序。"""
+    rows = conn.execute(
+        "SELECT start_m,end_m,iri FROM inspect_segments "
+        "WHERE lane=? AND device_id=? AND run_id=? AND iri IS NOT NULL",
+        (lane, device_id, run_id),
+    ).fetchall()
+    return sorted({(r[0], r[1], r[2]) for r in rows})
+
+
+def _tiles(segs):
+    """同一跑次的去重区间(已排序, 互不重叠)是否连续无空洞地拼接。"""
+    return all(segs[k][1] == segs[k + 1][0] for k in range(len(segs) - 1))
+
+
+def compare_run_segments(segs_a, segs_b):
+    """比对两个跑次的带测值区间(各自已去重、排序、互不重叠)。
+
+    最小共用区间: 两边都能用完整原段连续拼成、且无法按双方分段边界再拆小的
+    区间 —— 即两边区间相交关系(有正长度交集才算相交)的连通分量中, 双方各自
+    的原段恰好连续铺满同一里程段的分量。各自均值为原段 iri 按原段长度加权。
+
+    返回 (common, only_a, only_b):
+      common: [(start, end, mean_a, mean_b)]  最小共用区间及双方加权均值
+      only_a / only_b: [(start, end)]  该跑次有测值却未配对的里程(相邻已合并)
+    """
+    items = ([(s, e, v, 0) for s, e, v in segs_a]
+             + [(s, e, v, 1) for s, e, v in segs_b])
+    items.sort(key=lambda x: (x[0], x[1]))
+    # 按相交关系聚连通分量: 起点落在当前分量内部(严格小于分量右端)才归入
+    clusters, cur_a, cur_b, cur_end = [], [], [], None
+    for s, e, v, side in items:
+        if cur_end is None or s >= cur_end:
+            if cur_a or cur_b:
+                clusters.append((cur_a, cur_b))
+            cur_a, cur_b, cur_end = [], [], e
+        elif e > cur_end:
+            cur_end = e
+        (cur_a if side == 0 else cur_b).append((s, e, v))
+    if cur_a or cur_b:
+        clusters.append((cur_a, cur_b))
+
+    common, only_a, only_b = [], [], []
+    for a_segs, b_segs in clusters:
+        if (a_segs and b_segs and _tiles(a_segs) and _tiles(b_segs)
+                and (a_segs[0][0], a_segs[-1][1]) == (b_segs[0][0], b_segs[-1][1])):
+            s, e = a_segs[0][0], a_segs[-1][1]
+            mean_a = sum(v * (ee - ss) for ss, ee, v in a_segs) / (e - s)
+            mean_b = sum(v * (ee - ss) for ss, ee, v in b_segs) / (e - s)
+            common.append((s, e, mean_a, mean_b))
+        else:  # 无法两边都用完整原段拼成 -> 各自里程记为未配对
+            only_a.extend((s, e) for s, e, _ in a_segs)
+            only_b.extend((s, e) for s, e, _ in b_segs)
+    return common, merge_ranges(only_a), merge_ranges(only_b)
+
+
+def compare_runs(conn, lane, dev_a, run_a, dev_b, run_b, limit=5000):
+    """比对同车道两台不同设备各自的跑次: 最小共用区间 + 各自未配对里程。
+
+    均值与差值(前者减后者)的单位均为 0.001 m/km, 与原始 iri 列一致。
+    """
+    if dev_a == dev_b:
+        raise CsvError("需选择两台不同设备的跑次")
+    segs_a = load_iri_segments(conn, lane, dev_a, run_a)
+    segs_b = load_iri_segments(conn, lane, dev_b, run_b)
+    common, only_a, only_b = compare_run_segments(segs_a, segs_b)
+    truncated = len(common) > limit or len(only_a) > limit or len(only_b) > limit
+    return {
+        "lane": lane, "dev_a": dev_a, "run_a": run_a,
+        "dev_b": dev_b, "run_b": run_b,
+        "unit": "0.001 m/km",
+        "has_value_a": bool(segs_a),
+        "has_value_b": bool(segs_b),
+        "common": [
+            {"start_m": s, "end_m": e, "iri_a": ma, "iri_b": mb, "diff": ma - mb}
+            for s, e, ma, mb in common[:limit]
+        ],
+        "unpaired_a": [{"start_m": s, "end_m": e} for s, e in only_a[:limit]],
+        "unpaired_b": [{"start_m": s, "end_m": e} for s, e in only_b[:limit]],
+        "truncated": truncated,
+    }
+
+
+def list_iri_runs(conn, lane):
+    """列出某车道下有带测值(iri)记录的设备及其跑次, 供比对页选择。"""
+    rows = conn.execute(
+        "SELECT DISTINCT device_id, run_id FROM inspect_segments "
+        "WHERE lane=? AND iri IS NOT NULL ORDER BY device_id, run_id",
+        (lane,),
+    ).fetchall()
+    devices = {}
+    for d, r in rows:
+        devices.setdefault(d, []).append(r)
+    return [{"device_id": d, "runs": rs} for d, rs in sorted(devices.items())]
 
 
 # ---------------------------------------------------------------- 查询

@@ -11,7 +11,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app.core import apply_batch
+from app.core import apply_batch, compare_runs
 from app.db import get_conn, init_db
 
 LANE = "PERF-LANE"
@@ -27,7 +27,8 @@ def make_inspect_rows(run_idx):
     run = f"RUN-{run_idx:02d}"
     base = 1_700_000_000 + run_idx  # 各设备检测时刻错开
     for i in range(ROWS_PER_RUN):
-        rows.append((i * SEG, (i + 1) * SEG, base, dev, run))
+        # 相邻不重叠的带测值区间, 上传时会经过同组冲突检查
+        rows.append((i * SEG, (i + 1) * SEG, base, dev, run, 1000 + (i % 500)))
     return rows
 
 
@@ -67,14 +68,14 @@ def main():
     # 3) 整批更正一个局部批次(只影响局部米段)
     conn = get_conn()
     # 先录入一个局部小批
-    small = [(100_000, 100_200, 1_700_300_000, "DEV-X", "RUN-X1")]
+    small = [(100_000, 100_200, 1_700_300_000, "DEV-X", "RUN-X1", 1100)]
     timed("upload small inspect batch (1 row)", lambda: (
         conn.execute("BEGIN IMMEDIATE"),
         apply_batch(conn, LANE, "inspect", "JC-X", small, 1_700_300_000),
         conn.commit(),
     ))
     # 更正它: 范围仍在原米段附近 -> 只重算涉及的米段
-    small2 = [(100_000, 100_200, 1_700_300_100, "DEV-Y", "RUN-Y1")]
+    small2 = [(100_000, 100_200, 1_700_300_100, "DEV-Y", "RUN-Y1", 1200)]
     timed("correct small batch (local recompute)", lambda: (
         conn.execute("BEGIN IMMEDIATE"),
         apply_batch(conn, LANE, "inspect", "JC-X", small2, 1_700_300_100),
@@ -94,6 +95,12 @@ def main():
         "SELECT COUNT(*) FROM inspect_segments WHERE lane=?", (LANE,)
     ).fetchone()[0]
     print(f"inspect rows in lane: {insp}")
+
+    # 5) 两个跑次的 IRI 比对(各 1 万段带测值区间)
+    cmp = timed("compare two runs (10k valued segments each)", lambda: compare_runs(
+        conn, LANE, "DEV-00", "RUN-00", "DEV-01", "RUN-01", limit=10**9))
+    print(f"  -> common {len(cmp['common'])}, unpaired a/b: "
+          f"{len(cmp['unpaired_a'])}/{len(cmp['unpaired_b'])}")
     conn.close()
 
 

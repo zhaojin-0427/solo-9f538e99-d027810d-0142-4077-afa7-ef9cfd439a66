@@ -17,6 +17,8 @@ from .core import (
     NEEDED_DEVICES,
     CsvError,
     apply_batch,
+    compare_runs,
+    list_iri_runs,
     parse_inspect_csv,
     parse_repave_csv,
     query_acceptance,
@@ -73,11 +75,19 @@ def index(
     lane: Optional[str] = None,
     start_m: Optional[str] = None,
     end_m: Optional[str] = None,
+    cmp_lane: Optional[str] = None,
+    dev_a: Optional[str] = None,
+    run_a: Optional[str] = None,
+    dev_b: Optional[str] = None,
+    run_b: Optional[str] = None,
     msg: str = "",
     ok: str = "",
 ):
     conn = get_conn()
     try:
+        # 整页(批次列表 + 交验查询 + 跑次比对)在同一个读事务里取数,
+        # 保证整页以同一份已提交的数据快照为准(WAL 下读事务看到一致快照)
+        conn.execute("BEGIN")
         lanes = [
             r[0]
             for r in conn.execute("SELECT DISTINCT lane FROM batches ORDER BY lane")
@@ -99,6 +109,20 @@ def index(
                 results, truncated = query_acceptance(conn, lane, a, b, RESULT_LIMIT)
             except (CsvError, TypeError, ValueError):
                 error = "查询参数无效: 车道必选, 且需满足 0 <= 起点 < 终点(整数米)"
+        cmp = None
+        cmp_error = None
+        if cmp_lane:
+            picks = [dev_a, run_a, dev_b, run_b]
+            if all(picks):
+                try:
+                    cmp = compare_runs(
+                        conn, cmp_lane, dev_a, run_a, dev_b, run_b, RESULT_LIMIT
+                    )
+                except CsvError as e:
+                    cmp_error = str(e)
+            elif any(picks):
+                cmp_error = "请完整选择两台不同设备各自的跑次"
+        conn.commit()
         return templates.TemplateResponse(
             request,
             "index.html",
@@ -111,6 +135,13 @@ def index(
                 "q_lane": lane or "",
                 "q_start": start_m or "",
                 "q_end": end_m or "",
+                "cmp": cmp,
+                "cmp_error": cmp_error,
+                "q_cmp_lane": cmp_lane or "",
+                "q_dev_a": dev_a or "",
+                "q_run_a": run_a or "",
+                "q_dev_b": dev_b or "",
+                "q_run_b": run_b or "",
                 "msg": msg,
                 "ok": ok == "1",
                 "needed": NEEDED_DEVICES,
@@ -189,6 +220,35 @@ def api_acceptance(lane: str, start_m: int, end_m: int):
         "truncated": truncated,
         "segments": results,
     }
+
+
+@app.get("/api/inspect_runs")
+def api_inspect_runs(lane: str):
+    """某车道下有带测值(iri)记录的设备及其跑次(供比对页联动下拉)。"""
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN")
+        devices = list_iri_runs(conn, lane)
+        conn.commit()
+    finally:
+        conn.close()
+    return {"lane": lane, "devices": devices}
+
+
+@app.get("/api/iri_compare")
+def api_iri_compare(lane: str, dev_a: str, run_a: str, dev_b: str, run_b: str):
+    """比对两台不同设备各自的跑次: 最小共用区间、加权均值、差值与未配对里程。"""
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN")  # 同一读事务 -> 同一份已提交快照
+        try:
+            result = compare_runs(conn, lane, dev_a, run_a, dev_b, run_b, RESULT_LIMIT)
+        except CsvError as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
+        conn.commit()
+    finally:
+        conn.close()
+    return result
 
 
 @app.get("/api/batches")

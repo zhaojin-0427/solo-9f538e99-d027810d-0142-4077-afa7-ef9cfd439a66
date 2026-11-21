@@ -38,6 +38,7 @@ CREATE INDEX IF NOT EXISTS idx_repave_lane ON repave_segments(lane, start_m, end
 CREATE INDEX IF NOT EXISTS idx_repave_cover ON repave_segments(lane, start_m, end_m, completed_at);
 
 -- 检测原始记录: 左闭右开整数米段 + 检测时刻(UTC秒) + 设备号 + 跑次号
+-- iri 为可选测值(0.001 m/km 为单位的非负整数), 未填为 NULL, 不影响交验
 CREATE TABLE IF NOT EXISTS inspect_segments (
   lane        TEXT NOT NULL,
   start_m     INTEGER NOT NULL,
@@ -45,6 +46,7 @@ CREATE TABLE IF NOT EXISTS inspect_segments (
   measured_at INTEGER NOT NULL,
   device_id   TEXT NOT NULL,
   run_id      TEXT NOT NULL,
+  iri         INTEGER,
   batch_no    TEXT NOT NULL,
   CHECK (start_m >= 0 AND end_m > start_m)
 );
@@ -96,5 +98,19 @@ def init_db() -> None:
     conn = get_conn()
     try:
         conn.executescript(SCHEMA)
+        _migrate(conn)
     finally:
         conn.close()
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """对既有数据库做就地升级: inspect_segments 补 iri 列(旧库无此列)。"""
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(inspect_segments)")]
+    if "iri" not in cols:
+        conn.execute("ALTER TABLE inspect_segments ADD COLUMN iri INTEGER")
+    # 覆盖索引: 按 车道+设备+跑次 取带测值区间(上传冲突检查与跑次比对), 只读索引;
+    # 依赖 iri 列, 须在补列之后创建
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_inspect_iri "
+        "ON inspect_segments(lane, device_id, run_id, iri, start_m, end_m)"
+    )
